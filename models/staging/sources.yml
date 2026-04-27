@@ -1,0 +1,14 @@
+version: 2
+
+sources:
+  - name: teleclinic_raw
+    description: "Raw TeleClinic ingestion tables."
+    tables:
+      - name: consultations
+        description: "Raw consultation events with created/started timestamps."
+      - name: intake_flags
+        description: "Patient intake flags captured before consultation."
+      - name: clinical_outcomes
+        description: "Doctor-recorded clinical outcomes per consultation."
+      - name: providers
+        description: "Provider reference table."
