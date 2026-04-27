@@ -1,0 +1,267 @@
+version: 2
+
+# ────────────────────────────────────────────────────────────────────────────
+# Schema tests for Irembo TeleClinic dbt models.
+# MoM anomaly detection and tz-fix validation live in tests/ as singular
+# .sql files (test_referral_rate_mom_spike.sql, test_no_negative_wait_after_tz_fix.sql).
+# ────────────────────────────────────────────────────────────────────────────
+
+models:
+
+  # ── STAGING ────────────────────────────────────────────────────────────────
+  - name: stg_consultations_fixed
+    description: >
+      Consultations with timezone-normalized timestamps and cleaned wait times.
+      Filters out TEST_ accounts and flags records where started_at carried a
+      UTC offset string that required correction.
+    columns:
+
+      - name: consultation_id
+        description: "Primary key — one row per consultation."
+        tests:
+          - unique:
+              config:
+                severity: error
+                meta:
+                  description: >
+                    Duplicate consultation IDs would inflate monthly utilization
+                    counts and distort referral rates in Ministry reporting.
+          - not_null:
+              config:
+                severity: error
+                meta:
+                  description: >
+                    Every clinical encounter must be traceable. A null ID makes
+                    the row unjoignable to outcomes and referral data.
+
+      - name: created_at_utc
+        description: "Canonical UTC consultation creation timestamp."
+        tests:
+          - not_null:
+              config:
+                severity: error
+                meta:
+                  description: >
+                    Creation time anchors wait-time calculation and monthly
+                    bucketing. Its absence breaks queue monitoring and patient
+                    safety reporting.
+
+      - name: is_tz_corrected
+        description: >
+          Boolean flag (0/1) marking records where started_at contained a UTC
+          offset string (e.g. UTC+2) that was stripped and re-normalized to UTC.
+        tests:
+          - accepted_values:
+              values: [0, 1]
+              config:
+                severity: error
+                meta:
+                  description: >
+                    Constrains the timezone-fix flag to valid boolean states.
+                    An unexpected value here signals a regex failure in the
+                    normalization logic, making QA results unreproducible.
+
+      - name: wait_minutes
+        description: >
+          Minutes between consultation creation and start, post-tz-correction.
+          NULL where the value is negative or exceeds 720 min (12 h threshold).
+        tests:
+          - dbt_utils.expression_is_true:
+              expression: "wait_minutes >= 0"
+              config:
+                # NULL wait_minutes rows pass correctly — NULL >= 0 evaluates to
+                # NULL (not FALSE) in ClickHouse, so nulled implausible records
+                # are not flagged as failures here.
+                severity: error
+                meta:
+                  description: >
+                    Negative wait times are physically impossible and indicate
+                    unresolved timestamp normalization errors. Any failure here
+                    must be resolved before the dashboard is published.
+          - dbt_utils.expression_is_true:
+              expression: "wait_minutes <= 720"
+              config:
+                # NULL rows pass (NULL <= 720 = NULL, not FALSE).
+                # Asserts the 720-min upper bound defined in the model comment is
+                # actually enforced — not just documented.
+                severity: error
+                meta:
+                  description: >
+                    Waits over 12 hours (720 min) are implausible for a
+                    teleconsult triage flow and must be NULL, not a large number.
+                    A value above 720 means the if() threshold in the model failed.
+
+  # ── INTERMEDIATE ───────────────────────────────────────────────────────────
+  - name: int_referrals_classified
+    description: >
+      One row per completed consultation with referral classification.
+      Classifies each consultation as doctor_referral, patient_requested_only,
+      both, or no_referral based on clinical_outcomes and intake_flags sources.
+    columns:
+
+      - name: consultation_id
+        description: "Grain key — one row per completed consultation."
+        tests:
+          - unique:
+              config:
+                severity: error
+                meta:
+                  description: >
+                    Each consultation must contribute exactly once to referral
+                    rates. Duplicates here would silently inflate the Ministry KPI.
+          - not_null:
+              config:
+                severity: error
+                meta:
+                  description: >
+                    A null consultation_id cannot be joined to the mart and
+                    would produce orphaned referral records in monthly reporting.
+
+      - name: referral_type
+        description: >
+          Referral classification label. Used as the primary dimension in
+          mart_referral_rate_monthly to produce comparable month-over-month rates.
+        tests:
+          - not_null:
+              config:
+                severity: error
+                meta:
+                  description: >
+                    A null referral_type means the CASE WHEN logic failed to
+                    classify a consultation, which would silently drop it from
+                    all referral rate calculations.
+          - accepted_values:
+              values: ['doctor_referral', 'patient_requested_only', 'both', 'no_referral']
+              config:
+                severity: error
+                meta:
+                  description: >
+                    Constrains classification to the four defined buckets.
+                    An unexpected value indicates a schema change in upstream
+                    sources that would silently shift clinical KPI definitions.
+
+      - name: is_doctor_referral
+        description: "1 if the doctor recorded a referral in clinical_outcomes, else 0."
+        tests:
+          - accepted_values:
+              values: [0, 1]
+              config:
+                severity: error
+                meta:
+                  description: >
+                    Doctor referral flag must be a clean boolean. Non-boolean
+                    values here would corrupt the clinical referral rate, the
+                    primary KPI reported to the Ministry of Health.
+
+      - name: is_patient_requested
+        description: "1 if the patient ticked 'referral requested' in intake_flags, else 0."
+        tests:
+          - accepted_values:
+              values: [0, 1]
+              config:
+                severity: error
+                meta:
+                  description: >
+                    Patient request flag must be a clean boolean. The April
+                    anomaly (11%→28%) was caused by this field being included
+                    unexpectedly; bounding it to 0/1 catches upstream schema drift.
+
+  # ── MART ───────────────────────────────────────────────────────────────────
+  - name: mart_referral_rate_monthly
+    description: >
+      Monthly referral summary with separated clinical and patient-request rates.
+      The primary KPI for Ministry reporting is doctor_referral_rate_pct.
+    columns:
+
+      - name: report_month
+        description: "First day of the reporting month. One row per month."
+        tests:
+          - unique:
+              config:
+                severity: error
+                meta:
+                  description: >
+                    A duplicate month row means two conflicting values would be
+                    sent to the Ministry. This must be a hard error, not a warning.
+          - not_null:
+              config:
+                severity: error
+                meta:
+                  description: >
+                    Orphan metric rows with no month cannot appear in trend charts
+                    or be reconciled with the Ministry's reporting calendar.
+
+      - name: total_consultations
+        description: "Completed consultations in the reporting month."
+        tests:
+          - not_null:
+              config:
+                severity: error
+                meta:
+                  description: >
+                    A null denominator makes rate calculations undefined.
+                    Every published month must have a consultation count.
+          - dbt_utils.expression_is_true:
+              expression: "total_consultations > 0"
+              config:
+                severity: error
+                meta:
+                  description: >
+                    A month with zero consultations should not appear in the mart.
+                    Its presence would indicate a bad GROUP BY or a phantom date
+                    being injected by a pipeline error.
+
+      - name: doctor_referral_rate_pct
+        description: >
+          Percentage of completed consultations where the doctor issued a referral.
+          Primary clinical KPI. Stored as a percentage value (e.g. 11.0 = 11%).
+        tests:
+          - not_null:
+              config:
+                severity: error
+                meta:
+                  description: >
+                    The Ministry KPI cannot be null. A null here means the
+                    denominator (total_consultations) resolved to zero or null,
+                    which total_consultations > 0 test above should have caught.
+          - dbt_utils.expression_is_true:
+              # Rate is stored as percentage (0–100), not decimal (0.0–1.0)
+              expression: "doctor_referral_rate_pct >= 0 and doctor_referral_rate_pct <= 100"
+              config:
+                severity: error
+                meta:
+                  description: >
+                    Referral rate must fall within a valid 0–100% range.
+                    Values outside this range indicate a calculation error in
+                    the mart aggregation logic and must block publication.
+
+      - name: patient_requested_rate_pct
+        description: >
+          Percentage of consultations where a patient checked 'referral requested'.
+          Tracked separately from doctor_referral_rate_pct for comparability.
+          Expected to be 0 for months before the April 3 intake form release.
+        tests:
+          - dbt_utils.expression_is_true:
+              expression: "patient_requested_rate_pct >= 0 and patient_requested_rate_pct <= 100"
+              config:
+                severity: error
+                meta:
+                  description: >
+                    Patient referral request rate must be within 0–100%. A value
+                    above 100 would expose a double-counting bug in the mart aggregation.
+
+      - name: dashboard_referral_rate_pct
+        description: >
+          Combined referral rate counting any consultation where either
+          doctor_referral or patient_requested is true (no double-counting).
+          Matches the pre-fix dashboard figure for reference only.
+        tests:
+          - dbt_utils.expression_is_true:
+              expression: "dashboard_referral_rate_pct >= 0 and dashboard_referral_rate_pct <= 100"
+              config:
+                severity: warn
+                meta:
+                  description: >
+                    The combined rate is a legacy-compatibility column and carries
+                    warn severity — it should not be cited to the Ministry without
+                    confirming the clinical vs. patient split is understood.
