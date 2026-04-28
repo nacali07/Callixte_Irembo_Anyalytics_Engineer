@@ -1,4 +1,4 @@
-# Irembo TeleClinic Analytics Engineer Take-Home
+# Irembo TeleClinic Analytics Engineer
 
 This repository contains my **Part 1** written responses and **Part 2** dbt models and tests.
 
